@@ -11,10 +11,11 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from .auth import create_token, current_user, hash_password, require_roles
-from .db import connection, init_schema
+from .db import connection, init_schema, transaction
 from .middlewares.request_context import AuditRequestMiddleware
 from .schemas.domain import LoginIn, LiftIn, ItemIn, NoticeIn, RecheckIn, RecheckReviewIn
-from .services.queries import fetch_items, fetch_lift
+from .services import review
+from .services.queries import fetch_lift
 from .utils.audit import log_action
 
 redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
@@ -140,7 +141,10 @@ def get_lift(lift_id: int, user=Depends(current_user)):
     lift["inspection_items"] = rows("SELECT * FROM inspection_items WHERE lift_id=%s ORDER BY critical DESC,id", (lift_id,))
     lift["notices"] = rows("""SELECT n.*,i.code item_code,i.title item_title FROM rectification_notices n
       JOIN inspection_items i ON i.id=n.inspection_item_id WHERE n.lift_id=%s ORDER BY n.id DESC""", (lift_id,))
-    lift["analysis"] = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
+    current = review.current_analysis(lift_id)
+    lift["analysis"] = current if current else row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
+    if lift["analysis"]:
+        lift["analysis"]["stale"] = bool(lift["analysis"].get("superseded")) or int(lift["analysis"].get("input_version", -1)) != int(lift["data_version"])
     lift["certificate"] = row("SELECT * FROM certificates WHERE lift_id=%s AND status='issued' ORDER BY id DESC LIMIT 1", (lift_id,))
     return lift
 
@@ -150,49 +154,82 @@ def add_inspection_item(lift_id: int, payload: ItemIn, user=Depends(require_role
     ensure_lift_access(lift_id)
     if payload.result not in {"pass", "fail", "na"}:
         raise HTTPException(422, "检验结果必须是 pass/fail/na")
-    try:
-        item_id = execute("""INSERT INTO inspection_items(lift_id,code,title,category,critical,score,result,notes,photo_ref,inspected_at,status)
-          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')""", (lift_id, payload.code, payload.title, payload.category, payload.critical, payload.score, payload.result, payload.notes, payload.photo_ref, datetime.utcnow()))
-    except Exception as exc:
-        if "Duplicate" in str(exc):
-            raise HTTPException(409, "同一电梯的检验项编码已存在")
-        raise
-    execute("UPDATE lifts SET status='under_review' WHERE id=%s AND status='active'", (lift_id,))
-    log_action(int(user["sub"]), "add_inspection_item", "inspection_item", item_id, {"lift_id": lift_id, "code": payload.code, "result": payload.result})
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("""INSERT INTO inspection_items(lift_id,code,title,category,critical,score,result,notes,photo_ref,inspected_at,status)
+                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')""", (lift_id, payload.code, payload.title, payload.category, payload.critical, payload.score, payload.result, payload.notes, payload.photo_ref, datetime.utcnow()))
+            except Exception as exc:
+                if "Duplicate" in str(exc):
+                    raise HTTPException(409, "同一电梯的检验项编码已存在")
+                raise
+            item_id = cur.lastrowid
+            cur.execute("UPDATE lifts SET status='under_review' WHERE id=%s AND status='active'", (lift_id,))
+            # 补录即事实变更：版本推进，旧复核（含在途任务）一律过期归档，签证必须等重算。
+            new_version = review.bump_lift_data_version(conn, lift_id, "补录检验项 %s，旧复核结论已过期" % payload.code)
+    log_action(int(user["sub"]), "add_inspection_item", "inspection_item", item_id, {"lift_id": lift_id, "code": payload.code, "result": payload.result, "data_version": new_version})
     return row("SELECT * FROM inspection_items WHERE id=%s", (item_id,))
 
 
 @app.post("/api/lifts/{lift_id}/review")
 def enqueue_review(lift_id: int, user=Depends(require_roles("operator", "supervisor"))):
     ensure_lift_access(lift_id)
-    items = fetch_items(lift_id)
-    if len(items) < 3:
-        raise HTTPException(409, "至少录入 3 个检验项后才能复核")
-    if row("SELECT id FROM analysis_jobs WHERE lift_id=%s AND status IN ('queued','running')", (lift_id,)):
-        raise HTTPException(409, "该电梯已有复核任务在处理中")
-    features = {
-        "critical_fail_count": sum(1 for x in items if x["result"] == "fail" and x["critical"]),
-        "average_score": round(sum(float(x["score"]) for x in items if x["result"] != "na") / max(1, sum(1 for x in items if x["result"] != "na")), 2),
-        "failed_item_count": sum(1 for x in items if x["result"] == "fail"),
-        "documentation_gap": sum(1 for x in items if x["category"] == "documentation" and x["result"] == "fail"),
-    }
-    job_id = execute("INSERT INTO analysis_jobs(lift_id,status,features_json) VALUES(%s,'queued',%s)", (lift_id, json.dumps(features)))
-    redis_client.lpush("lift_analysis", str(job_id))
-    execute("UPDATE lifts SET status='under_review' WHERE id=%s", (lift_id,))
-    log_action(int(user["sub"]), "enqueue_review", "analysis_job", job_id, {"lift_id": lift_id, "features": features})
-    return {"job_id": job_id, "status": "queued", "features": features}
+
+    def push_queue(job_id):
+        redis_client.lpush("lift_analysis", str(job_id))
+
+    try:
+        result = review.create_review_job(lift_id, int(user["sub"]), push_queue)
+    except LookupError:
+        raise HTTPException(404, "电梯档案不存在")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    log_action(int(user["sub"]), "enqueue_review", "analysis_job", result["job_id"], {"lift_id": lift_id, "features": result["features"], "input_version": result["input_version"]})
+    return result
 
 
 @app.get("/api/lifts/{lift_id}/analysis")
 def get_analysis(lift_id: int, user=Depends(current_user)):
     ensure_lift_access(lift_id)
-    result = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
-    if result and result.get("path_rules_json"):
+    result = review.current_analysis(lift_id)
+    if not result:
+        # 没有当前版本的有效结论时，仍把最新一条（可能已过期）告诉工作台，用于提示“待重算”。
+        latest = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
+        if latest:
+            latest["stale"] = True
+            return latest
+        return {"status": "not_started"}
+    result["stale"] = False
+    if result.get("path_rules_json"):
         try:
             result["path_rules"] = json.loads(result["path_rules_json"])
         except Exception:
             result["path_rules"] = result["path_rules_json"]
-    return result or {"status": "not_started"}
+    return result
+
+
+@app.get("/api/lifts/{lift_id}/analysis-history")
+def analysis_history(lift_id: int, user=Depends(current_user)):
+    ensure_lift_access(lift_id)
+    lift = row("SELECT id,data_version FROM lifts WHERE id=%s", (lift_id,))
+    if not lift:
+        raise HTTPException(404, "电梯档案不存在")
+    jobs = review.latest_jobs(lift_id, limit=20)
+    for job in jobs:
+        job["stale"] = bool(job["superseded"]) or int(job["input_version"]) != int(lift["data_version"])
+        if job.get("path_rules_json"):
+            try:
+                job["path_rules"] = json.loads(job["path_rules_json"])
+            except Exception:
+                job["path_rules"] = job["path_rules_json"]
+        if job.get("input_snapshot_json"):
+            try:
+                job["input_snapshot"] = json.loads(job["input_snapshot_json"])
+            except Exception:
+                job["input_snapshot"] = job["input_snapshot_json"]
+    return {"data_version": lift["data_version"], "jobs": normalize(jobs)}
 
 
 @app.get("/api/notices")
@@ -244,52 +281,113 @@ def create_recheck(payload: RecheckIn, user=Depends(require_roles("operator", "s
 def review_recheck(recheck_id: int, payload: RecheckReviewIn, user=Depends(require_roles("supervisor"))):
     if payload.result not in {"pass", "fail"}:
         raise HTTPException(422, "复检结果必须是 pass/fail")
-    record = row("""SELECT r.*,n.lift_id,n.inspection_item_id FROM rechecks r JOIN rectification_notices n ON n.id=r.notice_id WHERE r.id=%s""", (recheck_id,))
-    if not record:
-        raise HTTPException(404, "复检预约不存在")
-    status = "passed" if payload.result == "pass" else "failed"
-    execute("UPDATE rechecks SET status=%s,result=%s,remarks=%s,reviewed_by=%s,reviewed_at=%s WHERE id=%s", (status, payload.result, payload.remarks, int(user["sub"]), datetime.utcnow(), recheck_id))
-    notice_status = "verified" if payload.result == "pass" else "rejected"
-    execute("UPDATE rectification_notices SET status=%s WHERE id=%s", (notice_status, record["notice_id"]))
-    execute("UPDATE inspection_items SET status=%s,result=%s WHERE id=%s", ("verified" if payload.result == "pass" else "open", payload.result, record["inspection_item_id"]))
-    execute("UPDATE lifts SET status=%s WHERE id=%s", ("under_review" if payload.result == "pass" else "rectification", record["lift_id"]))
-    log_action(int(user["sub"]), "review_recheck", "recheck", recheck_id, {"result": payload.result, "notice_id": record["notice_id"]})
-    return row("SELECT * FROM rechecks WHERE id=%s", (recheck_id,))
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT r.*,n.lift_id,n.inspection_item_id,i.code item_code
+              FROM rechecks r JOIN rectification_notices n ON n.id=r.notice_id
+              JOIN inspection_items i ON i.id=n.inspection_item_id WHERE r.id=%s FOR UPDATE""", (recheck_id,))
+            record = cur.fetchone()
+            if not record:
+                raise HTTPException(404, "复检预约不存在")
+            status = "passed" if payload.result == "pass" else "failed"
+            cur.execute("UPDATE rechecks SET status=%s,result=%s,remarks=%s,reviewed_by=%s,reviewed_at=%s WHERE id=%s", (status, payload.result, payload.remarks, int(user["sub"]), datetime.utcnow(), recheck_id))
+            notice_status = "verified" if payload.result == "pass" else "rejected"
+            cur.execute("UPDATE rectification_notices SET status=%s WHERE id=%s", (notice_status, record["notice_id"]))
+            cur.execute("UPDATE inspection_items SET status=%s,result=%s WHERE id=%s", ("verified" if payload.result == "pass" else "open", payload.result, record["inspection_item_id"]))
+            cur.execute("UPDATE lifts SET status=%s WHERE id=%s", ("under_review" if payload.result == "pass" else "rectification", record["lift_id"]))
+            # 复检改判改变了检验事实（即便分值未变）：旧复核结论一律过期，签证等重算。
+            new_version = review.bump_lift_data_version(conn, record["lift_id"], "复检 %s 改判为 %s，旧复核结论已过期" % (record["item_code"], payload.result))
+    log_action(int(user["sub"]), "review_recheck", "recheck", recheck_id, {"result": payload.result, "notice_id": record["notice_id"], "data_version": new_version})
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM rechecks WHERE id=%s", (recheck_id,))
+            return normalize(cur.fetchone())
 
 
 @app.get("/api/certificates")
 def list_certificates(user=Depends(current_user)):
-    return rows("""SELECT c.*,l.asset_code,l.building,u.name issuer FROM certificates c JOIN lifts l ON l.id=c.lift_id JOIN users u ON u.id=c.issued_by ORDER BY c.id DESC""")
+    return rows("""SELECT c.*,l.asset_code,l.building,u.name issuer,
+      c.analysis_job_id AS based_on_job_id,
+      j.input_version AS based_on_version, j.prediction AS based_on_prediction
+      FROM certificates c JOIN lifts l ON l.id=c.lift_id JOIN users u ON u.id=c.issued_by
+      LEFT JOIN analysis_jobs j ON j.id=c.analysis_job_id ORDER BY c.id DESC""")
+
+
+@app.get("/api/certificates/{cert_id}/basis")
+def certificate_basis(cert_id: int, user=Depends(current_user)):
+    """签证采信的复核：原始输入快照 + 规则路径，支撑事后审计。"""
+    cert = row("""SELECT c.*,l.asset_code,l.building FROM certificates c
+      JOIN lifts l ON l.id=c.lift_id WHERE c.id=%s""", (cert_id,))
+    if not cert:
+        raise HTTPException(404, "证书不存在")
+    job = None
+    if cert.get("analysis_job_id"):
+        job = row("SELECT * FROM analysis_jobs WHERE id=%s", (cert["analysis_job_id"],))
+        if job:
+            for key in ("path_rules_json", "input_snapshot_json", "features_json"):
+                if job.get(key):
+                    try:
+                        job[key.replace("_json", "")] = json.loads(job[key])
+                    except Exception:
+                        pass
+    return {"certificate": cert, "analysis_job": normalize(job) if job else None}
 
 
 @app.post("/api/lifts/{lift_id}/certificate")
 def issue_certificate(lift_id: int, user=Depends(require_roles("supervisor"))):
     ensure_lift_access(lift_id)
-    lift = row("SELECT * FROM lifts WHERE id=%s", (lift_id,))
-    items = rows("SELECT * FROM inspection_items WHERE lift_id=%s", (lift_id,))
-    open_notices = row("SELECT COUNT(*) count FROM rectification_notices WHERE lift_id=%s AND status NOT IN ('verified','closed')", (lift_id,))["count"]
-    failed_critical = [x for x in items if x["critical"] and x["result"] == "fail"]
-    recheck_passed = row("""SELECT COUNT(*) count FROM rechecks r JOIN rectification_notices n ON n.id=r.notice_id
-      WHERE n.lift_id=%s AND r.status='passed'""", (lift_id,))["count"]
-    analysis = row("SELECT * FROM analysis_jobs WHERE lift_id=%s AND status='completed' ORDER BY id DESC LIMIT 1", (lift_id,))
-    blockers = []
-    if failed_critical:
-        blockers.append("安全回路或制动器关键项仍不合格，一票否决")
-    if open_notices:
-        blockers.append("仍有未验证的整改通知")
-    if not analysis or analysis["prediction"] not in {"ready", "review"}:
-        blockers.append("尚未完成有效的树模型复核")
-    if open_notices and not recheck_passed:
-        blockers.append("存在整改项但没有通过复检")
-    if blockers:
-        log_action(int(user["sub"]), "certificate_blocked", "lift", lift_id, {"blockers": blockers})
-        raise HTTPException(409, {"code": "CERTIFICATE_BLOCKED", "blockers": blockers})
-    cert_no = f"NANJING-{datetime.utcnow().year}-{lift['asset_code']}-{uuid.uuid4().hex[:6].upper()}"
-    cert_id = execute("""INSERT INTO certificates(lift_id,certificate_no,issued_at,valid_until,status,decision_reason,issued_by)
-      VALUES(%s,%s,%s,%s,'issued',%s,%s)""", (lift_id, cert_no, datetime.utcnow(), date.today().replace(year=date.today().year+1), "规则路径复核通过，关键安全项与复检证据均满足签发条件", int(user["sub"])))
-    execute("UPDATE lifts SET status='certified' WHERE id=%s", (lift_id,))
-    log_action(int(user["sub"]), "issue_certificate", "certificate", cert_id, {"lift_id": lift_id, "certificate_no": cert_no})
-    return row("SELECT * FROM certificates WHERE id=%s", (cert_id,))
+    blocked = None
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            # 锁定电梯行：检验变更与签证并发时，谁先拿到锁谁先落定事实，后到者按新版本裁决。
+            try:
+                lift, analysis = review.certifiable_analysis(conn, lift_id)
+            except LookupError:
+                raise HTTPException(404, "电梯档案不存在")
+            cur.execute("SELECT * FROM inspection_items WHERE lift_id=%s", (lift_id,))
+            items = normalize(cur.fetchall())
+            cur.execute("SELECT COUNT(*) count FROM rectification_notices WHERE lift_id=%s AND status NOT IN ('verified','closed')", (lift_id,))
+            open_notices = cur.fetchone()["count"]
+            failed_critical = [x for x in items if x["critical"] and x["result"] == "fail"]
+            cur.execute("""SELECT COUNT(*) count FROM rechecks r JOIN rectification_notices n ON n.id=r.notice_id
+              WHERE n.lift_id=%s AND r.status='passed'""", (lift_id,))
+            recheck_passed = cur.fetchone()["count"]
+            blockers = []
+            if failed_critical:
+                blockers.append("安全回路或制动器关键项仍不合格，一票否决")
+            if open_notices:
+                blockers.append("仍有未验证的整改通知")
+            if open_notices and not recheck_passed:
+                blockers.append("存在整改项但没有通过复检")
+            if not analysis:
+                # 区分“没算过”和“算过但已过期”，让主管明确知道要等重算。
+                cur.execute("SELECT 1 FROM analysis_jobs WHERE lift_id=%s LIMIT 1", (lift_id,))
+                if cur.fetchone():
+                    blockers.append("复核结论已过期：检验项补录或复检改判后需重新提交树模型复核")
+                else:
+                    blockers.append("尚未完成有效的树模型复核")
+            elif analysis["prediction"] not in {"ready", "review"}:
+                blockers.append("当前树模型分流结论为 %s，不满足签发条件" % analysis["prediction"])
+            if blockers:
+                # 审计写入与阻断判定在同一事务提交，避免抛出异常把审计记录一起回滚。
+                cur.execute("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,detail) VALUES(%s,'certificate_blocked','lift',%s,%s)",
+                            (int(user["sub"]), lift_id, json.dumps({"blockers": blockers, "data_version": lift["data_version"]}, ensure_ascii=False)))
+                blocked = {"code": "CERTIFICATE_BLOCKED", "blockers": blockers, "data_version": lift["data_version"]}
+            else:
+                cert_no = f"NANJING-{datetime.utcnow().year}-{lift['asset_code']}-{uuid.uuid4().hex[:6].upper()}"
+                decision_reason = "规则路径复核通过（复核任务 #%s，事实版本 v%s），关键安全项与复检证据均满足签发条件" % (analysis["id"], lift["data_version"])
+                cur.execute("""INSERT INTO certificates(lift_id,certificate_no,issued_at,valid_until,status,decision_reason,issued_by,analysis_job_id)
+                  VALUES(%s,%s,%s,%s,'issued',%s,%s,%s)""", (lift_id, cert_no, datetime.utcnow(), date.today().replace(year=date.today().year+1), decision_reason, int(user["sub"]), analysis["id"]))
+                cert_id = cur.lastrowid
+                cur.execute("UPDATE lifts SET status='certified' WHERE id=%s", (lift_id,))
+                cur.execute("INSERT INTO audit_logs(actor_id,action,entity_type,entity_id,detail) VALUES(%s,'issue_certificate','certificate',%s,%s)",
+                            (int(user["sub"]), cert_id, json.dumps({"lift_id": lift_id, "certificate_no": cert_no, "analysis_job_id": analysis["id"], "data_version": lift["data_version"]}, ensure_ascii=False)))
+                cur.execute("SELECT * FROM certificates WHERE id=%s", (cert_id,))
+                cert_row = normalize(cur.fetchone())
+    # 事务已提交后再抛出，阻断审计得以保留。
+    if blocked:
+        raise HTTPException(409, blocked)
+    return cert_row
 
 
 @app.get("/api/audit-logs")

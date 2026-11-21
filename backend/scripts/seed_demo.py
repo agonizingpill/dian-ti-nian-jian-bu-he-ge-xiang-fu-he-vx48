@@ -1,9 +1,11 @@
+import json
 import os
 import sys
 from datetime import date, datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from src.db import connection, init_schema
 from src.auth import hash_password
+from src.algorithm import build_features, classify
 
 USERS = [
     ("operator@jingcheng.com", "李倩", "operator"),
@@ -73,7 +75,51 @@ def seed():
             cur.execute("SELECT id FROM rechecks WHERE notice_id=%s AND status='evidence_rejected'", (notice["id"],))
             if notice and not cur.fetchone():
                 cur.execute("INSERT INTO rechecks(notice_id,scheduled_at,inspector,status,photo_ref,photo_item_code,remarks,created_by) VALUES(%s,%s,'王工','evidence_rejected','IMG-YT-021-03.jpg','DOOR_FORCE','历史照片与安全回路项不匹配，已退回补证',%s)", (notice["id"],datetime(2026,11,23,14,0),user_ids["operator@jingcheng.com"]))
-    print("seed_demo complete: users=3 lifts=4 inspection_items=20")
+
+            # 复核任务演示：合格梯保留一条当前版本可采信结论；金盛广场演示“旧结论已过期待重算”。
+            cur.execute("SELECT j.id FROM analysis_jobs j JOIN lifts l ON l.id=j.lift_id WHERE l.asset_code='NJ-XH-118' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute("SELECT id FROM lifts WHERE asset_code='NJ-XH-118'")
+                xh_id = cur.fetchone()["id"]
+                cur.execute("SELECT * FROM inspection_items WHERE lift_id=%s ORDER BY critical DESC,id", (xh_id,))
+                items = cur.fetchall()
+                features = build_features(items)
+                result = classify(features)
+                snapshot = [{"id": x["id"], "code": x["code"], "title": x["title"], "category": x["category"],
+                             "critical": bool(x["critical"]), "score": float(x["score"]), "result": x["result"], "status": x["status"]} for x in items]
+                cur.execute("""INSERT INTO analysis_jobs(lift_id,status,features_json,prediction,probability,path_rules_json,input_version,input_snapshot_json,superseded,completed_at)
+                  VALUES(%s,'completed',%s,%s,%s,%s,0,%s,0,%s)""",
+                  (xh_id, json.dumps(features, ensure_ascii=False), result["prediction"], result["probability"],
+                   json.dumps({"rules": result["path_rules"], "model": result["model"], "features": features}, ensure_ascii=False),
+                   json.dumps(snapshot, ensure_ascii=False), datetime(2026,11,20,10,15)))
+                cur.execute("SELECT id FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (xh_id,))
+                xh_job = cur.fetchone()["id"]
+                cur.execute("""INSERT INTO certificates(lift_id,certificate_no,issued_at,valid_until,status,decision_reason,issued_by,analysis_job_id)
+                  VALUES(%s,%s,%s,%s,'issued',%s,%s,%s)
+                  ON DUPLICATE KEY UPDATE decision_reason=VALUES(decision_reason), analysis_job_id=VALUES(analysis_job_id)""",
+                  (xh_id, f"NANJING-2026-NJ-XH-118-SEED01", datetime(2026,11,20,11,0), date(2027,11,20),
+                   f"规则路径复核通过（复核任务 #{xh_job}，事实版本 v0），关键安全项与复检证据均满足签发条件",
+                   user_ids["supervisor@jingcheng.com"], xh_job))
+                cur.execute("UPDATE lifts SET status='certified' WHERE id=%s", (xh_id,))
+
+            cur.execute("SELECT j.id FROM analysis_jobs j JOIN lifts l ON l.id=j.lift_id WHERE l.asset_code='NJ-JS-307' LIMIT 1")
+            if not cur.fetchone():
+                cur.execute("SELECT id FROM lifts WHERE asset_code='NJ-JS-307'")
+                js_id = cur.fetchone()["id"]
+                cur.execute("SELECT * FROM inspection_items WHERE lift_id=%s ORDER BY critical DESC,id", (js_id,))
+                items = cur.fetchall()
+                features = build_features(items)
+                result = classify(features)
+                snapshot = [{"id": x["id"], "code": x["code"], "title": x["title"], "category": x["category"],
+                             "critical": bool(x["critical"]), "score": float(x["score"]), "result": x["result"], "status": x["status"]} for x in items]
+                # 第一条：旧版本 v0 的结论，已被 v1 事实（补录/改判）取代；当前无有效任务，工作台提示“待重算”。
+                cur.execute("""INSERT INTO analysis_jobs(lift_id,status,features_json,prediction,probability,path_rules_json,input_version,input_snapshot_json,superseded,superseded_reason,completed_at)
+                  VALUES(%s,'completed',%s,%s,%s,%s,0,%s,1,%s,%s)""",
+                  (js_id, json.dumps(features, ensure_ascii=False), result["prediction"], result["probability"],
+                   json.dumps({"rules": result["path_rules"], "model": result["model"], "features": features}, ensure_ascii=False),
+                   json.dumps(snapshot, ensure_ascii=False), "补录检验项 VISUAL_042，旧复核结论已过期", datetime(2026,11,19,16,40)))
+                cur.execute("UPDATE lifts SET data_version=1, status='under_review' WHERE id=%s", (js_id,))
+    print("seed_demo complete: users=3 lifts=4 inspection_items=20 analysis_jobs=demo")
 
 if __name__ == "__main__":
     seed()
