@@ -1,0 +1,104 @@
+name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}-db
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-lift_review}
+      MYSQL_USER: ${MYSQL_USER:-lift_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-lift_pass}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_pass}
+    ports:
+      - "${DB_PORT:-17765}:3306"
+    volumes:
+      - lift_db_data:/var/lib/mysql
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}-redis
+    ports:
+      - "16365:6379"
+    volumes:
+      - lift_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    container_name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}-backend
+    environment:
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-lift_review}
+      MYSQL_USER: ${MYSQL_USER:-lift_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-lift_pass}
+      JWT_SECRET: ${JWT_SECRET:-gb1066-demo-secret}
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${BACKEND_PORT:-19265}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - lift_artifacts:/shared
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  worker:
+    build: ./worker
+    container_name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}-worker
+    environment:
+      MYSQL_HOST: db
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-lift_review}
+      MYSQL_USER: ${MYSQL_USER:-lift_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-lift_pass}
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - lift_artifacts:/shared
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /shared/worker_healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build: ./frontend
+    container_name: ${COMPOSE_PROJECT_NAME:-lift-inspection-review}-frontend
+    ports:
+      - "${FRONTEND_PORT:-18265}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  lift_db_data:
+  lift_redis_data:
+  lift_artifacts:

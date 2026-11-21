@@ -1,0 +1,4 @@
+pymysql==1.1.1
+redis==5.2.1
+scikit-learn==1.5.2
+cryptography==44.0.0

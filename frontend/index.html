@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>电梯年检 · 复核台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <section id="login-view" class="login-shell">
+    <div class="login-hero">
+      <div class="blueprint-mark"><span>↗</span><span>⌁</span><span>⌁</span></div>
+      <p class="eyebrow">南京市特种设备数字化年检</p>
+      <h1>把每个不合格项<br><em>追到证书签发</em></h1>
+      <p class="hero-note">电梯档案、检验项、整改证据与复检决定，在同一条可审计链路上闭环。</p>
+      <div class="hero-rule"><span></span><span></span><span></span></div>
+    </div>
+    <div class="login-card">
+      <div class="brandline"><span class="brand-dot"></span><strong>Lift Review / 1066</strong><span class="status-pill">年度检验季</span></div>
+      <h2>登录复核工作台</h2>
+      <p class="muted">选择一个演示账号进入对应权限视图</p>
+      <form id="login-form">
+        <label>工作邮箱<input id="login-email" type="email" value="operator@jingcheng.com" required /></label>
+        <label>密码<input id="login-password" type="password" value="Demo@1066" required /></label>
+        <button class="primary wide" type="submit">进入工作台 <span>→</span></button>
+      </form>
+      <div class="demo-accounts">
+        <button data-demo="operator@jingcheng.com">操作员 <span>录入 / 整改 / 预约</span></button>
+        <button data-demo="supervisor@jingcheng.com">主管 <span>复核 / 证书签发</span></button>
+        <button data-demo="viewer@jingcheng.com">查看员 <span>只读 / 审计</span></button>
+      </div>
+    </div>
+  </section>
+
+  <section id="app-view" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="side-brand"><div class="brand-square">L</div><div><strong>Lift Review</strong><small>INSPECTION CONTROL</small></div></div>
+      <div class="side-context"><span class="context-dot"></span><span>秦淮片区 · 2026 年度</span></div>
+      <nav>
+        <button class="nav-item active" data-page="dashboard"><span>⌂</span>总览</button>
+        <button class="nav-item" data-page="lifts"><span>▦</span>设备档案</button>
+        <button class="nav-item" data-page="inspections"><span>◈</span>检验复核</button>
+        <button class="nav-item" data-page="rechecks"><span>↺</span>复检与证书</button>
+        <button class="nav-item" data-page="audit"><span>≡</span>审计轨迹</button>
+      </nav>
+      <div class="sidebar-foot"><div class="foot-line"></div><small>安全关键项一票否决<br />照片证据需逐项匹配</small></div>
+    </aside>
+    <main class="main-shell">
+      <header class="topbar"><div><p class="eyebrow">特种设备检验闭环</p><h1 id="page-title">年度复核总览</h1></div><div class="user-chip"><div class="avatar" id="user-avatar">L</div><div><strong id="user-name">—</strong><small id="user-role">—</small></div><button id="logout">退出</button></div></header>
+      <div id="page-content"></div>
+    </main>
+  </section>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
